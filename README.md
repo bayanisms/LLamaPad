@@ -8,11 +8,42 @@ LlamaPad has separate **Inference Server** and **RPC Node** workspaces. The infe
 
 This is a development source release, version **0.3.2**. It targets stock iPadOS 18 or later on Apple M-series iPads, with device-dependent runtime tuning. Other chips have not been qualified by this release. The app must remain in the foreground. Installation requires signing with your own Apple developer account; increased-memory access depends on provisioning and the operating system.
 
+## Measured performance
+
+The recorded hardware is an **M1 Pro Mac with 16 GiB RAM and an M1 iPad with 16 GiB RAM**. These are local measurements on that pair, not results for the base M1 Mac or every M-series device. Rates below are pooled **generation tokens/s**, with startup and warmup excluded.
+
+### What the iPad adds
+
+| Model / configuration | Mac alone | Mac + iPad RPC | Observed value |
+| --- | ---: | ---: | --- |
+| LFM2.5-24B-A2B Q4_K_M, ordinary chat | 4.47 | **29.59** | **6.62x throughput** versus the tested 8 GiB Mac expert-cache configuration; six matched replies per mode |
+| Qwen3.6-27B Q4_K_M, native-MTP-preserved variant | Memory guard stopped startup; no completed rate | 3.56 ordinary / **8.15 with MTP4** | Runs within the tested Mac memory budget; no Mac-only speedup ratio is claimed |
+
+The LFM comparison uses the same weights and prompts, a 2,048-token context capacity, no speculation, and a 70/30 Mac/iPad split. The Mac-only case uses six CPU threads and an 8 GiB GPU expert cache; RPC uses two coordinator threads. All six returned texts match. The benefit is avoiding the tested single-device memory bottleneck. Qwen has eight completed replies per successful method; thermal behavior affects its measured rates.
+
+This comparison focuses on models that exceed the tested Mac memory budget. Moving weights onto the iPad can also leave more Mac memory for KV/recurrent state and runtime buffers. Larger contexts and higher-precision quants are potential uses of that capacity; their performance and maximum supported context have not yet been measured here.
+
+### Improvements retained in LlamaPad
+
+Separate control/candidate/candidate/control comparisons on the same LFM Q4_K_M weights measured:
+
+| Change and workload | Control | Selected | Generation change | Paired outputs |
+| --- | ---: | ---: | ---: | --- |
+| Router + gated-convolution fusions and GPU submission tuning, Mac + iPad | 29.11 | **30.11** | **+3.46%** | 12/12 identical |
+| Canonical replay + 26-token n-gram drafting versus the prior eight-token preset, full suite | 35.89 | **37.61** | **+4.79%** | 24/24 identical |
+| Same replay/drafting comparison, editing subset | 38.49 | **41.57** | **+7.98%** | 14/14 identical |
+
+The editing row is a subset of the full suite, not a separate additive gain. In that same replay comparison, fresh chat changed from 30.25 to 29.79 tokens/s (**-1.53%**). The replay change is in the Mac coordinator; the fusion/submission comparison enables changes on both GPUs. These experiments do not establish separate Mac-only or iPad-only engine speedups. Exact output agreement covers the measured greedy requests, not every prompt or sampler.
+
+The later 55/45 split reduces Mac model-buffer allocation by **2.04 GiB** versus the earlier 70/30 placement. That is allocation saved, not a guarantee of 2 GiB physically free RAM. Experimental settings are opt-in; the results are not default-app guarantees, and ordinary 24B chat has not reached 60 tokens/s.
+
+See [benchmark methods, settings and limitations](docs/BENCHMARKS.md) and [sanitized timing/output-hash data](docs/benchmark-results.json). The comparisons are separate experiments; their speedups must not be multiplied together.
+
 ## Included source
 
 The native engine and chat UI source are vendored in `vendor/llama.cpp`. The pinned upstream revision is recorded in [upstream.lock](upstream.lock). The current LlamaPad engine modifications are included both in that source and in [patches/0001-llamapad-engine.patch](patches/0001-llamapad-engine.patch). Source archives build without a nested Git checkout.
 
-The package contains no model weights, test suites, build products, signed applications, provisioning profiles, device records or benchmark logs. Model licenses and compatibility must be checked separately.
+The package contains no model weights, test suites, build products, signed applications, provisioning profiles, device records or raw benchmark logs. The benchmark documentation contains only sanitized results. Model licenses and compatibility must be checked separately.
 
 ## Build and install
 
@@ -88,6 +119,7 @@ RPC provides additional model capacity. Sequential layer execution and transport
 - [Inference and RPC usage](docs/USAGE.md)
 - [Architecture and source layout](docs/ARCHITECTURE.md)
 - [Engine changes and performance tuning](docs/ENGINE.md)
+- [Measured benchmarks and methodology](docs/BENCHMARKS.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Data storage and privacy](PRIVACY.md)
 - [Security considerations](SECURITY.md)

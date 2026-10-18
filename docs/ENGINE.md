@@ -23,7 +23,7 @@ Use ordinary decoding and default kernel dispatch first. Choose a model and spli
 
 Compare identical prompts, sampling settings, context and output limits. Record first-token latency separately from generation rate, warm up separately, disable prefix reuse for independent requests and repeat both configurations. Track memory pressure and thermals throughout. Do not infer a kernel speedup from a change in draft acceptance or cooling state.
 
-No private benchmark data or machine-specific performance claims are distributed in this package. The source does not promise a particular token rate.
+[Measured benchmarks](BENCHMARKS.md) describe the tested M1 Pro/M1 pair, settings and limits. Only sanitized measurement summaries are published; private device records and raw runtime logs are excluded. The source does not promise a particular token rate.
 
 ## Experimental launcher options
 

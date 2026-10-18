@@ -16,4 +16,4 @@ The following checks were completed on the prepared source folder:
 
 These checks do not constitute a fresh signed device installation or a complete correctness/security audit. Runtime performance and model compatibility require validation on the intended devices. The source manifest and ZIP checksum provide file integrity; they are not publisher signatures.
 
-No tests, model weights, local benchmark records, runtime logs, Git history, compiled application/native libraries, signing credentials, provisioning profiles, device records or computer-specific configuration are distributed. Public third-party copyright and author notices remain intact.
+No tests, model weights, private benchmark records, raw runtime logs, Git history, compiled application/native libraries, signing credentials, provisioning profiles, device records or computer-specific configuration are distributed. The benchmark documentation includes only sanitized settings, measurements and returned-output hashes. Public third-party copyright and author notices remain intact.
