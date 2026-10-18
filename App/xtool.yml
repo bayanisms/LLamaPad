@@ -1,0 +1,6 @@
+version: 1
+bundleID: dev.local.LlamaPad
+product: LlamaPad
+infoPath: Info.plist
+entitlementsPath: LlamaPad.entitlements
+iconPath: Artwork/AppIcon.png

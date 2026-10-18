@@ -1,0 +1,1474 @@
+diff --git a/ggml/include/ggml-metal.h b/ggml/include/ggml-metal.h
+index 433838f..4877979 100644
+--- a/ggml/include/ggml-metal.h
++++ b/ggml/include/ggml-metal.h
+@@ -54,6 +54,14 @@ GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend,
+ // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
+ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
+ 
++// Process-wide completed graph-command timings. Does not add GPU waits.
++struct ggml_metal_activity {
++    uint64_t command_nanoseconds;
++    uint64_t command_count;
++};
++GGML_BACKEND_API void ggml_backend_metal_monitor_enable(bool enabled);
++GGML_BACKEND_API void ggml_backend_metal_monitor_stats(struct ggml_metal_activity * stats);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
+ 
+ #ifdef __cplusplus
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 482bd36..61292ad 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -16,6 +16,29 @@ static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROT
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+ 
++// Optional lifecycle and allocation budget for an embedded, single-client TCP worker.
++// The owner must join run_server before freeing its control or callback data.
++typedef struct ggml_rpc_server_control * ggml_rpc_server_control_t;
++typedef size_t (*ggml_rpc_memory_available_t)(void * user_data);
++GGML_BACKEND_API ggml_rpc_server_control_t ggml_rpc_server_control_new(
++    size_t allocation_limit, ggml_rpc_memory_available_t available, void * user_data);
++GGML_BACKEND_API void ggml_rpc_server_control_stop(ggml_rpc_server_control_t control);
++GGML_BACKEND_API void ggml_rpc_server_control_free(ggml_rpc_server_control_t control);
++GGML_BACKEND_API bool ggml_rpc_server_control_ready(ggml_rpc_server_control_t control);
++GGML_BACKEND_API size_t ggml_rpc_server_control_allocated(ggml_rpc_server_control_t control);
++GGML_BACKEND_API bool ggml_backend_rpc_run_server(const char * endpoint, const char * cache_dir,
++    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices, ggml_rpc_server_control_t control);
++
++struct ggml_rpc_server_stats {
++    uint64_t bytes_received;
++    uint64_t bytes_sent;
++    uint64_t graph_calls;
++    uint64_t dispatch_nanoseconds;
++    uint64_t allocation_limit;
++    uint32_t connected_clients;
++};
++GGML_BACKEND_API void ggml_rpc_server_control_stats(ggml_rpc_server_control_t control, struct ggml_rpc_server_stats * stats);
++
+ // backend API
+ GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
+ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.cpp b/ggml/src/ggml-metal/ggml-metal-common.cpp
+index 70fd551..1578552 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-backend-impl.h"
+ 
+ #include <vector>
++#include <cstdlib>
+ 
+ // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
+ // 512 run on the simdgroup kernel and need no threadgroup memory. The wider ones allocate
+@@ -119,6 +120,18 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
+ 
+ // the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured on an M3 Ultra)
+ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
++    // Opt-in LlamaPad experiment: compare existing K-quant verification kernels
++    // on older Apple GPUs without changing the upstream default for any chip.
++    static const int64_t k_rows_override = []() -> int64_t {
++        const char * value = std::getenv("LLAMAPAD_METAL_K_MMA_MIN_ROWS");
++        if (!value) return 0;
++        char * end = nullptr;
++        const long rows = std::strtol(value, &end, 10);
++        return end != value && *end == '\0' && rows >= 2 && rows <= 17 ? rows : 0;
++    }();
++    if (k_rows_override && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)) {
++        return k_rows_override;
++    }
+     switch (type) {
+         case GGML_TYPE_F32:
+             return 6;
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e906466..c4ebcc4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -1,4 +1,5 @@
+ #import "ggml-metal-context.h"
++#import "ggml-metal.h"
+ 
+ #import "ggml-impl.h"
+ #import "ggml-backend-impl.h"
+@@ -11,6 +12,39 @@
+ #import <Foundation/Foundation.h>
+ 
+ #import <Metal/Metal.h>
++#include <float.h>
++#include <stdatomic.h>
++#include <os/lock.h>
++
++static atomic_bool monitor_enabled = false;
++static os_unfair_lock monitor_lock = OS_UNFAIR_LOCK_INIT;
++static struct ggml_metal_activity monitor_activity;
++
++void ggml_backend_metal_monitor_enable(bool enabled) {
++    atomic_store_explicit(&monitor_enabled, enabled, memory_order_relaxed);
++}
++
++void ggml_backend_metal_monitor_stats(struct ggml_metal_activity * stats) {
++    os_unfair_lock_lock(&monitor_lock);
++    *stats = monitor_activity;
++    os_unfair_lock_unlock(&monitor_lock);
++}
++
++static void ggml_metal_monitor_command(id<MTLCommandBuffer> command) {
++    if (!atomic_load_explicit(&monitor_enabled, memory_order_relaxed)) {
++        return;
++    }
++    [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
++        const double start = completed.GPUStartTime;
++        const double end = completed.GPUEndTime;
++        if (completed.status == MTLCommandBufferStatusCompleted && start > 0 && end >= start) {
++            os_unfair_lock_lock(&monitor_lock);
++            monitor_activity.command_nanoseconds += (uint64_t) ((end - start) * 1e9);
++            monitor_activity.command_count++;
++            os_unfair_lock_unlock(&monitor_lock);
++        }
++    }];
++}
+ 
+ #undef MIN
+ #undef MAX
+@@ -42,6 +76,12 @@
+     bool use_graph_optimize;
+ 
+     int debug_graph;
++    bool profile_graph;
++    bool profile_pending;
++    uint64_t profile_id;
++    int64_t profile_encode_us;
++    int profile_nodes;
++    int64_t profile_tokens;
+ 
+     struct ggml_metal_fusion_info * finfo;
+ 
+@@ -140,6 +180,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+         res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
+ 
+         res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
++        res->profile_graph = getenv("LLAMAPAD_METAL_PROFILE") != NULL;
+ 
+         {
+             const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
+@@ -281,6 +322,24 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     }
+ 
+     // release any completed extra command buffers
++    if (ctx->profile_graph && ctx->profile_pending) {
++        double start = DBL_MAX;
++        double end = 0.0;
++        double busy = 0.0;
++        for (int i = 0; i <= ctx->n_cb; ++i) {
++            id<MTLCommandBuffer> cb = ctx->cmd_bufs[i].obj;
++            if (cb && cb.GPUEndTime > cb.GPUStartTime && cb.GPUStartTime > 0.0) {
++                start = MIN(start, cb.GPUStartTime);
++                end = MAX(end, cb.GPUEndTime);
++                busy += cb.GPUEndTime - cb.GPUStartTime;
++            }
++        }
++        GGML_LOG_INFO("llamapad_metal_profile: graph=%llu nodes=%d tokens=%lld encode_ms=%.3f gpu_span_ms=%.3f command_ms=%.3f\n",
++                (unsigned long long) ctx->profile_id, ctx->profile_nodes, (long long) ctx->profile_tokens,
++                ctx->profile_encode_us / 1000.0, end > start ? (end - start) * 1000.0 : 0.0, busy * 1000.0);
++        ctx->profile_pending = false;
++    }
++
+     if (ctx->cmd_bufs_ext.count > 0) {
+         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+@@ -472,6 +531,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
+ }
+ 
+ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
++    const int64_t profile_start = ctx->profile_graph ? ggml_time_us() : 0;
+     if (ctx->has_error) {
+         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
+         return GGML_STATUS_FAILED;
+@@ -562,6 +622,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             }
+             ctx->cmd_bufs[n_cb].obj = cmd_buf;
+ 
++            ggml_metal_monitor_command(cmd_buf);
++
+             [cmd_buf enqueue];
+ 
+             ctx->encode_async(n_cb);
+@@ -581,6 +643,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             }
+             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
+ 
++            ggml_metal_monitor_command(cmd_buf);
++
+             // always enqueue the first two command buffers
+             // enqueue all of the command buffers if we don't need to abort
+             if (cb_idx < 2 || ctx->abort_callback == NULL) {
+@@ -593,6 +657,19 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         }
+ 
+         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
++        if (ctx->profile_graph) {
++            ctx->profile_encode_us = ggml_time_us() - profile_start;
++            ctx->profile_nodes = gf->n_nodes;
++            ctx->profile_tokens = 0;
++            for (int i = 0; i < gf->n_nodes; ++i) {
++                if (gf->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
++                    ctx->profile_tokens = gf->nodes[i]->src[2]->ne[1];
++                    break;
++                }
++            }
++            ctx->profile_id++;
++            ctx->profile_pending = true;
++        }
+ 
+         // for debugging: block until graph is computed
+         //[ctx->cmd_buf_last waitUntilCompleted];
+@@ -706,6 +783,10 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
+ }
+ 
+ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
++    const char * value = getenv("LLAMAPAD_METAL_COMMAND_BUFFERS");
++    if (value && strlen(value) == 1 && value[0] >= '0' && value[0] <= '2') {
++        n_cb = value[0] - '0';
++    }
+     // when fusion stats are collected the graph must be encoded by a single thread so the
+     // counters are race-free; override whatever the caller requested
+     if (ggml_metal_fusion_info_stats(ctx->finfo)) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 2c7972b..f1321a4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -581,6 +581,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_mul(ggml_metal_library_t lib, int32_t nc) {
++    char name[256];
++    const char * base = "kernel_ssm_conv_mul_f32";
++    snprintf(name, sizeof(name), "%s_nc=%d", base, nc);
++    auto res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++        ggml_metal_cv_set_int32(cv, nc, FC_SSM_CONV + 2);
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++        ggml_metal_cv_free(cv);
++    }
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(
+         ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu) {
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+@@ -1199,6 +1213,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+     const int16_t r2 = (int16_t) (ne12 / ne02);
+     const int16_t r3 = (int16_t) (ne13 / ne03);
+ 
++    static const int dense_rows = []() {
++        const char * value = getenv("LLAMAPAD_METAL_DENSE_ROWS");
++        return value ? atoi(value) : 0;
++    }();
++    static const int dense_simdgroups = []() {
++        const char * value = getenv("LLAMAPAD_METAL_DENSE_SIMDGROUPS");
++        return value ? atoi(value) : 0;
++    }();
++    if ((tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) && tsrc1 == GGML_TYPE_F32 && ne11 == 1) {
++        const int rows = dense_rows == 4 || dense_rows == 8 ? dense_rows : nr0;
++        const int groups = dense_simdgroups == 2 || dense_simdgroups == 4 ? dense_simdgroups : nsg;
++        if (ne01 % (rows * groups) == 0) {
++            nsg = groups;
++            nr0 = rows;
++            suffix = rows == 4 ? "_r4" : rows == 8 ? "_r8" : "";
++        }
++    }
++
+     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+ 
+@@ -1520,6 +1552,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             }
+     };
+ 
++    static const int moe_rows = []() {
++        const char * value = getenv("LLAMAPAD_METAL_MOE_ROWS");
++        return value ? atoi(value) : 0;
++    }();
++    static const int moe_simdgroups = []() {
++        const char * value = getenv("LLAMAPAD_METAL_MOE_SIMDGROUPS");
++        return value ? atoi(value) : 0;
++    }();
++    if ((tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) && op->src[2]->ne[1] == 1) {
++        const int rows = moe_rows == 4 || moe_rows == 8 ? moe_rows : nr0;
++        const int groups = moe_simdgroups == 2 || moe_simdgroups == 4 ? moe_simdgroups : nsg;
++        // These kernels load complete row tiles before masking their stores.
++        if (ne01 % (rows * groups) == 0) {
++            nsg = groups;
++            nr0 = rows;
++            suffix = rows == 4 ? "_r4" : rows == 8 ? "_r8" : "";
++        }
++    }
++
+     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
+ 
+@@ -1706,12 +1757,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge(ggml
+ }
+ 
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe(
+-        ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm) {
++        ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm, bool with_sigmoid) {
+     char base[256];
+     char name[256];
+ 
+     snprintf(base, 256, "kernel_topk_moe_f32");
+-    snprintf(name, 256, "%s_n_expert=%d_top_k=%d_with_norm=%d", base, n_expert, top_k, with_norm ? 1 : 0);
++    snprintf(name, 256, "%s_n_expert=%d_top_k=%d_with_norm=%d_sigmoid=%d", base, n_expert, top_k, with_norm ? 1 : 0, with_sigmoid ? 1 : 0);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+@@ -1719,6 +1770,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe(
+         ggml_metal_cv_set_bool (cv, with_norm, FC_TOPK_MOE + 0);
+         ggml_metal_cv_set_int32(cv, n_expert,  FC_TOPK_MOE + 1);
+         ggml_metal_cv_set_int32(cv, top_k,     FC_TOPK_MOE + 2);
++        ggml_metal_cv_set_bool (cv, with_sigmoid, FC_TOPK_MOE + 3);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4012b9d..787cf3f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -128,6 +128,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_mul      (ggml_metal_library_t lib, int32_t nc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
+@@ -152,7 +153,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe          (ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe          (ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm, bool with_sigmoid);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce        (ggml_metal_library_t lib, int32_t n_expert_used);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin               (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one           (ggml_metal_library_t lib, enum ggml_op op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index d78ca7c..0b45c86 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-backend-impl.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstddef>
+ #include <cstring>
+ #include <set>
+@@ -66,6 +67,15 @@ struct ggml_metal_fusion {
+     }
+ };
+ 
++static bool ggml_metal_fusion_experiment_enabled(const ggml_metal_fusion & fusion) {
++    static const bool router = getenv("LLAMAPAD_METAL_SIGMOID_ROUTER") != nullptr;
++    static const bool conv = getenv("LLAMAPAD_METAL_GATED_CONV") != nullptr;
++    if (fusion.id == GGML_METAL_FUSION_TOPK_MOE && fusion.ops[0] == GGML_OP_UNARY) {
++        return router;
++    }
++    return fusion.id != GGML_METAL_FUSION_SSM_CONV_MUL || conv;
++}
++
+ ggml_metal_fusion_id ggml_metal_fusion_get_id(const ggml_metal_fusion * fusion) {
+     return fusion->id;
+ }
+@@ -362,6 +372,14 @@ static const std::vector<ggml_op> ops_topk_moe_norm_scale = {
+     GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+     GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
+ };
++static const std::vector<ggml_op> ops_sigmoid_moe_norm = {
++    GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
++    GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE
++};
++static const std::vector<ggml_op> ops_sigmoid_moe_norm_scale = {
++    GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
++    GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
++};
+ 
+ static bool ggml_metal_fusion_check_topk_moe(
+         const ggml_metal_fusion       * fusion,
+@@ -375,8 +393,10 @@ static bool ggml_metal_fusion_check_topk_moe(
+ 
+     const int n_ops = (int) fusion->ops.size();
+ 
+-    const bool with_norm  = n_ops >= 6;
+-    const bool with_scale = n_ops == 4 || n_ops == 7;
++    const bool with_sigmoid = fusion->ops[0] == GGML_OP_UNARY;
++    const int bias_offset = with_sigmoid ? 1 : 0;
++    const bool with_norm  = n_ops >= 6 + bias_offset;
++    const bool with_scale = n_ops == 4 + bias_offset || n_ops == 7 + bias_offset;
+ 
+     // the fusion table operates on the non-empty node sequence; the raw graph also
+     // contains the RESHAPE/VIEW nodes that the fused kernel elides.
+@@ -413,18 +433,30 @@ static bool ggml_metal_fusion_check_topk_moe(
+ 
+     const ggml_tensor * softmax        = gf->nodes[raw_start];
+     const ggml_tensor * probs_reshaped = gf->nodes[raw_start + 1];
+-    const ggml_tensor * argsort        = gf->nodes[raw_start + 2];
+-    const ggml_tensor * ids            = gf->nodes[raw_start + 3];
+-    const ggml_tensor * get_rows       = gf->nodes[raw_start + 4];
++    const ggml_tensor * argsort        = gf->nodes[raw_start + 2 + bias_offset];
++    const ggml_tensor * ids            = gf->nodes[raw_start + 3 + bias_offset];
++    const ggml_tensor * get_rows       = gf->nodes[raw_start + 4 + bias_offset];
+     const ggml_tensor * out            = gf->nodes[raw_end];
+     const ggml_tensor * logits         = softmax->src[0];
+ 
+-    // the fused kernel implements plain softmax only
++    const ggml_tensor * selection = softmax;
++    if (with_sigmoid) {
++        const ggml_tensor * add = gf->nodes[raw_start + 2];
++        const ggml_tensor * bias = add->src[1];
++        if (ggml_get_unary_op(softmax) != GGML_UNARY_OP_SIGMOID || add->src[0] != softmax ||
++            !bias || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
++            bias->ne[0] != logits->ne[0] || bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1) {
++            return false;
++        }
++        selection = add;
++    }
++
++    // The softmax variant implements plain softmax only.
+     float scale   = 1.0f;
+     float max_bias = 0.0f;
+     memcpy(&scale,    ((const int32_t *) softmax->op_params) + 0, sizeof(scale));
+     memcpy(&max_bias, ((const int32_t *) softmax->op_params) + 1, sizeof(max_bias));
+-    if (scale != 1.0f || max_bias != 0.0f || softmax->src[1] || softmax->src[2]) {
++    if (!with_sigmoid && (scale != 1.0f || max_bias != 0.0f || softmax->src[1] || softmax->src[2])) {
+         return false;
+     }
+ 
+@@ -437,6 +469,10 @@ static bool ggml_metal_fusion_check_topk_moe(
+     const int64_t n_tokens      = logits->ne[1];
+     const int64_t n_expert_used = ids->ne[0];
+ 
++    if (with_sigmoid && n_expert_used != 4) {
++        return false;
++    }
++
+     // note: n_tokens == 0 (no-output batch) must match so that the packing stays shape-independent
+     if (n_expert <= 0 || n_expert_used <= 0 || n_expert_used > n_expert ||
+         n_expert > GGML_METAL_TOPK_MOE_MAX_EXPERTS || n_expert_used > GGML_METAL_TOPK_MOE_MAX_EXPERTS) {
+@@ -455,17 +491,21 @@ static bool ggml_metal_fusion_check_topk_moe(
+         return false;
+     }
+ 
+-    if (probs_reshaped->src[0] != softmax || argsort->src[0] != softmax ||
++    if (probs_reshaped->src[0] != softmax || argsort->src[0] != selection ||
+         ids->src[0] != argsort || get_rows->src[0] != probs_reshaped || get_rows->src[1] != ids) {
+         return false;
+     }
+ 
+     if (with_norm) {
+-        const ggml_tensor * weights_reshaped = gf->nodes[raw_start + 5];
+-        const ggml_tensor * sum_rows         = gf->nodes[raw_start + 6];
+-        const ggml_tensor * clamp            = gf->nodes[raw_start + 7];
+-        const ggml_tensor * div              = gf->nodes[raw_start + 8];
+-        const ggml_tensor * out_reshaped     = gf->nodes[raw_start + 9];
++        const ggml_tensor * weights_reshaped = gf->nodes[raw_start + 5 + bias_offset];
++        const ggml_tensor * sum_rows         = gf->nodes[raw_start + 6 + bias_offset];
++        const ggml_tensor * clamp            = gf->nodes[raw_start + 7 + bias_offset];
++        const ggml_tensor * div              = gf->nodes[raw_start + 8 + bias_offset];
++        const ggml_tensor * out_reshaped     = gf->nodes[raw_start + 9 + bias_offset];
++
++        if (with_sigmoid && ggml_get_op_params_f32(clamp, 1) != INFINITY) {
++            return false;
++        }
+ 
+         if (weights_reshaped->src[0] != get_rows || sum_rows->src[0] != weights_reshaped ||
+             clamp->src[0] != sum_rows || div->src[0] != weights_reshaped || div->src[1] != clamp ||
+@@ -474,7 +514,7 @@ static bool ggml_metal_fusion_check_topk_moe(
+         }
+ 
+         if (with_scale) {
+-            const ggml_tensor * scale_node = gf->nodes[raw_start + 10];
++            const ggml_tensor * scale_node = gf->nodes[raw_start + 10 + bias_offset];
+             if (scale_node->src[0] != out_reshaped) {
+                 return false;
+             }
+@@ -486,7 +526,7 @@ static bool ggml_metal_fusion_check_topk_moe(
+         }
+     }
+ 
+-    const int outputs[2] = { raw_start + 3, raw_end };
++    const int outputs[2] = { raw_start + 3 + bias_offset, raw_end };
+     if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 2)) {
+         return false;
+     }
+@@ -725,7 +765,23 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
+ 
+ static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
+ 
++static bool ggml_metal_fusion_check_ssm_conv_mul(
++        const ggml_metal_fusion *, const ggml_tensor * const * nodes,
++        const ggml_cgraph *, const int *, int, ggml_metal_fusion_mode) {
++    const ggml_tensor * conv = nodes[0];
++    const ggml_tensor * mul = nodes[1];
++    const ggml_tensor * gate = mul->src[0] == conv ? mul->src[1] : mul->src[0];
++    return conv->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
++           gate && gate->type == GGML_TYPE_F32 && ggml_are_same_shape(conv, gate) &&
++           gate->nb[0] == sizeof(float) && ggml_is_contiguous(conv) && ggml_is_contiguous(mul) &&
++           conv->src[0]->type == GGML_TYPE_F32 && conv->src[1]->type == GGML_TYPE_F32 &&
++           conv->src[1]->ne[0] > 0 && conv->src[1]->ne[0] <= 16 &&
++           ggml_is_contiguous(conv->src[0]) && ggml_is_contiguous(conv->src[1]) &&
++           conv->ne[3] == 1 && ggml_nelements(conv) <= INT32_MAX;
++}
++
+ static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
++static const std::vector<ggml_op> ops_ssm_conv_mul  = { GGML_OP_SSM_CONV, GGML_OP_MUL };
+ 
+ static const std::vector<ggml_op> ops_moe_reduce_2 = {
+     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
+@@ -776,6 +832,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_scale,         {1},    true,  ggml_metal_fusion_check_topk_moe },
+     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_norm,          {1},    true,  ggml_metal_fusion_check_topk_moe },
+     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_norm_scale,    {1},    true,  ggml_metal_fusion_check_topk_moe },
++    { GGML_METAL_FUSION_TOPK_MOE,       ops_sigmoid_moe_norm,       {2},    true,  ggml_metal_fusion_check_topk_moe },
++    { GGML_METAL_FUSION_TOPK_MOE,       ops_sigmoid_moe_norm_scale, {2},    true,  ggml_metal_fusion_check_topk_moe },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_2,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_3,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_4,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+@@ -784,6 +842,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
++    { GGML_METAL_FUSION_SSM_CONV_MUL,   ops_ssm_conv_mul,           {},     false, ggml_metal_fusion_check_ssm_conv_mul },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+ };
+ 
+@@ -835,6 +894,9 @@ void ggml_metal_fusion_add_alloc_deps(
+         int best_raw = 0;
+ 
+         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
++            if (!ggml_metal_fusion_experiment_enabled(fusion)) {
++                continue;
++            }
+             if ((int) fusion.ops_all.size() <= best_raw) {
+                 continue;
+             }
+@@ -1083,6 +1145,9 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
+     int best = 1;
+ 
+     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
++        if (!ggml_metal_fusion_experiment_enabled(fusion)) {
++            continue;
++        }
+         const int n_ops = (int) fusion.ops.size();
+ 
+         // only look for a longer match than the current best
+@@ -1186,6 +1251,12 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
+         return 1;
+     }
+ 
++    if (getenv("LLAMAPAD_METAL_SINGLE_FUSION_PACK") != nullptr) {
++        int len = 1;
++        const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, 0, GGML_METAL_FUSION_STRUCTURAL, &len);
++        return fusion ? std::min(GGML_METAL_FUSION_MAX, idxs[len - 1] - idx + 1) : 1;
++    }
++
+     int total = 0;
+     int i_f = 0;
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 5d994c2..32faea4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -42,6 +42,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
+     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
+     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
++    GGML_METAL_FUSION_SSM_CONV_MUL,  // SSM_CONV + MUL (output gate)
+     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+ } ggml_metal_fusion_id;
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 4ffb5a7..3dd3bea 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -933,6 +933,12 @@ typedef struct {
+     uint64_t nb2;
+ } ggml_metal_kargs_ssm_conv;
+ 
++typedef struct {
++    ggml_metal_kargs_ssm_conv conv;
++    uint64_t nbg1;
++    uint64_t nbg2;
++} ggml_metal_kargs_ssm_conv_mul;
++
+ typedef struct {
+     int64_t  d_state;
+     int64_t  d_inner;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 53c9816..f360121 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -817,6 +817,14 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
+ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
++    if (op->op == GGML_OP_UNARY && ctx->use_fusion() && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID) {
++        int n = 1;
++        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
++        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_TOPK_MOE) {
++            return ggml_metal_op_topk_moe(ctx, idx);
++        }
++    }
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+@@ -1672,6 +1680,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+ 
+     int n_fuse = 1;
+     bool use_silu = false;
++    bool use_mul = false;
+ 
+     if (ctx->use_fusion()) {
+         int n = 1;
+@@ -1680,6 +1689,10 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+             n_fuse = n;
+             use_silu = true;
+ 
++            ctx->count_fusions(fusion);
++        } else if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SSM_CONV_MUL) {
++            n_fuse = n;
++            use_mul = true;
+             ctx->count_fusions(fusion);
+         }
+     }
+@@ -1704,6 +1717,21 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+ 
+     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
+ 
++    if (use_mul) {
++        const ggml_tensor * mul = ctx->node(idx + n_fuse - 1);
++        const ggml_tensor * gate = mul->src[0] == op ? mul->src[1] : mul->src[0];
++        ggml_metal_kargs_ssm_conv_mul gated_args = { args, gate->nb[1], gate->nb[2] };
++        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_mul(lib, (int32_t) ne10);
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes(enc, &gated_args, sizeof(gated_args), 0);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++        ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate), 4);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (ggml_nelements(op) + 31)/32, 1, 1, 32, 1, 1);
++        return n_fuse;
++    }
++
+     // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
+     const bool use_batched = (ne1 > 1);
+ 
+@@ -5740,7 +5768,9 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
+ 
+     ggml_tensor * softmax  = ctx->node(idx);
+     ggml_tensor * logits   = softmax->src[0];
+-    ggml_tensor * get_rows = ctx->node(idx + 2);
++    const bool with_sigmoid = softmax->op == GGML_OP_UNARY;
++    const int bias_offset = with_sigmoid ? 1 : 0;
++    ggml_tensor * get_rows = ctx->node(idx + 2 + bias_offset);
+     ggml_tensor * ids      = get_rows->src[1];
+     ggml_tensor * weights  = ctx->node(idx + n_fuse - 1);
+ 
+@@ -5748,12 +5778,12 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
+     const int64_t n_tokens      = logits->ne[1];
+     const int64_t n_expert_used = ids->ne[0];
+ 
+-    const bool with_norm  = n_fuse >= 6;
+-    const bool with_scale = n_fuse == 4 || n_fuse == 7;
++    const bool with_norm  = n_fuse >= 6 + bias_offset;
++    const bool with_scale = n_fuse == 4 + bias_offset || n_fuse == 7 + bias_offset;
+ 
+     float clamp = -INFINITY;
+     if (with_norm) {
+-        ggml_tensor * clamp_node = ctx->node(idx + 4);
++        ggml_tensor * clamp_node = ctx->node(idx + 4 + bias_offset);
+         clamp = ggml_get_op_params_f32(clamp_node, 0);
+     }
+ 
+@@ -5771,20 +5801,21 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
+         /*.scale =*/ scale,
+     };
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm);
++    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used, with_norm, with_sigmoid);
+ 
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits),  1);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),     3);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(with_sigmoid ? ctx->node(idx + 1)->src[1] : logits), 4);
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) n_tokens, 1, 1, 32, 1, 1);
+ 
+     ctx->count_fusions(fusion);
+ 
+     if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+-        GGML_LOG_DEBUG("%s: fuse: SOFT_MAX + ARGSORT + GET_ROWS\n", __func__);
++        GGML_LOG_DEBUG("%s: fuse: %s + ARGSORT + GET_ROWS\n", __func__, with_sigmoid ? "SIGMOID+BIAS" : "SOFT_MAX");
+     }
+ 
+     return n_fuse;
+diff --git a/ggml/src/ggml-metal/kernels/argsort.metal b/ggml/src/ggml-metal/kernels/argsort.metal
+index 5231b83..9a5281c 100644
+--- a/ggml/src/ggml-metal/kernels/argsort.metal
++++ b/ggml/src/ggml-metal/kernels/argsort.metal
+@@ -3,6 +3,7 @@
+ constant bool FC_topk_moe_with_norm [[function_constant(FC_TOPK_MOE + 0)]];
+ constant int  FC_topk_moe_n_expert  [[function_constant(FC_TOPK_MOE + 1)]];
+ constant int  FC_topk_moe_top_k     [[function_constant(FC_TOPK_MOE + 2)]];
++constant bool FC_topk_moe_sigmoid   [[function_constant(FC_TOPK_MOE + 3)]];
+ 
+ constant int  FC_moe_reduce_n_expert_used [[function_constant(FC_MOE_REDUCE + 0)]];
+ 
+@@ -349,6 +350,7 @@ kernel void kernel_topk_moe_f32(
+         device const char * src0,
+         device       float * weights,
+         device      int32_t * ids,
++        device const float * bias,
+         uint3   tgpig[[threadgroup_position_in_grid]],
+         ushort  tiisg[[thread_index_in_simdgroup]]) {
+     const int row = (int) tgpig.x;
+@@ -366,6 +368,7 @@ kernel void kernel_topk_moe_f32(
+     device      int32_t * ids_row   = ids + row * (args.nb1_ids / sizeof(int32_t));
+ 
+     float wt[32];
++    float unbiased[32];
+     float output_weights[32];
+     FOR_UNROLL (int i = 0; i < 32; ++i) {
+         wt[i]            = -INFINITY;
+@@ -377,23 +380,37 @@ kernel void kernel_topk_moe_f32(
+         wt[i / 32] = isnan(v) ? -FLT_MAX : v;
+     }
+ 
+-    // softmax over the expert logits
+-    float max_val = -INFINITY;
+-    FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+-        max_val = max(max_val, wt[i]);
+-    }
+-    max_val = simd_max(max_val);
++    if (FC_topk_moe_sigmoid) {
++        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
++            const int expert = lane + i * 32;
++            unbiased[i] = 1.0f / (1.0f + exp(-wt[i]));
++            if (expert < n_expert) {
++                const float selection = unbiased[i] + bias[expert];
++                // Keep -INFINITY reserved for entries already selected.
++                wt[i] = isnan(selection) || selection == -INFINITY ? -FLT_MAX : selection;
++            } else {
++                wt[i] = -INFINITY;
++            }
++        }
++    } else {
++        // softmax over the expert logits
++        float max_val = -INFINITY;
++        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
++            max_val = max(max_val, wt[i]);
++        }
++        max_val = simd_max(max_val);
+ 
+-    float sum_val = 0.0f;
+-    FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+-        wt[i] = exp(wt[i] - max_val);
+-        sum_val += wt[i];
+-    }
+-    sum_val = simd_sum(sum_val);
++        float sum_val = 0.0f;
++        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
++            wt[i] = exp(wt[i] - max_val);
++            sum_val += wt[i];
++        }
++        sum_val = simd_sum(sum_val);
+ 
+-    const float inv_sum = 1.0f / sum_val;
+-    FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+-        wt[i] *= inv_sum;
++        const float inv_sum = 1.0f / sum_val;
++        FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
++            wt[i] *= inv_sum;
++        }
+     }
+ 
+     float wt_sum = 0.0f;
+@@ -419,28 +436,39 @@ kernel void kernel_topk_moe_f32(
+             }
+         }
+ 
++        const float selected_weight = FC_topk_moe_sigmoid ?
++                simd_sum((best_expert & 31) == lane ? unbiased[best_expert / 32] : 0.0f) : best_val;
++
+         if ((best_expert & 31) == lane) {
+             wt[best_expert / 32] = -INFINITY;
+         }
+ 
+         if ((k & 31) == lane) {
+-            output_weights[k / 32] = best_val;
++            output_weights[k / 32] = selected_weight;
+         }
+ 
+         if ((best_expert & 31) == lane) {
+             ids_row[k] = best_expert;
+             if (FC_topk_moe_with_norm) {
+-                wt_sum += best_val;
++                wt_sum += selected_weight;
+             }
+         }
+     }
+ 
+     if (FC_topk_moe_with_norm) {
+-        wt_sum = simd_sum(wt_sum);
++        if (FC_topk_moe_sigmoid && top_k == 4) {
++            // Match the float4 SUM_ROWS path in routing-rank order.
++            const float4 selected = float4(
++                    simd_shuffle(output_weights[0], 0), simd_shuffle(output_weights[0], 1),
++                    simd_shuffle(output_weights[0], 2), simd_shuffle(output_weights[0], 3));
++            wt_sum = sum(selected);
++        } else {
++            wt_sum = simd_sum(wt_sum);
++        }
+         wt_sum = max(wt_sum, args.clamp);
+         const float inv = 1.0f / wt_sum;
+         FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
+-            output_weights[i] *= inv;
++            output_weights[i] = FC_topk_moe_sigmoid ? output_weights[i] / wt_sum : output_weights[i] * inv;
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 0d1069f..998084f 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -1628,6 +1628,19 @@ kernel void kernel_mul_mv_q4_K_f32(
+     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+ }
+ 
++template<int rows>
++kernel void kernel_mul_mv_q4_K_f32_tuned(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0, device const char * src1, device char * dst,
++        uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_q4_K_f32_impl<rows, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
++}
++
++typedef decltype(kernel_mul_mv_q4_K_f32_tuned<4>) mul_mv_q4_K_tuned_t;
++template [[host_name("kernel_mul_mv_q4_K_f32_r4")]] kernel mul_mv_q4_K_tuned_t kernel_mul_mv_q4_K_f32_tuned<4>;
++template [[host_name("kernel_mul_mv_q4_K_f32_r8")]] kernel mul_mv_q4_K_tuned_t kernel_mul_mv_q4_K_f32_tuned<8>;
++
+ template<int nr0, typename args_t>
+ void kernel_mul_mv_q5_K_f32_impl(
+         args_t args,
+@@ -1867,6 +1880,19 @@ kernel void kernel_mul_mv_q6_K_f32(
+     kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+ }
+ 
++template<int rows>
++kernel void kernel_mul_mv_q6_K_f32_tuned(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0, device const char * src1, device char * dst,
++        uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_q6_K_f32_impl<rows, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
++}
++
++typedef decltype(kernel_mul_mv_q6_K_f32_tuned<4>) mul_mv_q6_K_tuned_t;
++template [[host_name("kernel_mul_mv_q6_K_f32_r4")]] kernel mul_mv_q6_K_tuned_t kernel_mul_mv_q6_K_f32_tuned<4>;
++template [[host_name("kernel_mul_mv_q6_K_f32_r8")]] kernel mul_mv_q6_K_tuned_t kernel_mul_mv_q6_K_f32_tuned<8>;
++
+ // ======================= "True" 2-bit
+ 
+ template<int nr0, typename args_t>
+@@ -3384,8 +3410,12 @@ template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
+ template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
+ template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
++template [[host_name("kernel_mul_mv_id_q4_K_f32_r4")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl<4>>>;
++template [[host_name("kernel_mul_mv_id_q4_K_f32_r8")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl<8>>>;
+ template [[host_name("kernel_mul_mv_id_q5_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q5_K_f32_impl   <N_R0_Q5_K>>>;
+ template [[host_name("kernel_mul_mv_id_q6_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl   <N_R0_Q6_K>>>;
++template [[host_name("kernel_mul_mv_id_q6_K_f32_r4")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<4>>>;
++template [[host_name("kernel_mul_mv_id_q6_K_f32_r8")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<8>>>;
+ template [[host_name("kernel_mul_mv_id_iq1_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
+ template [[host_name("kernel_mul_mv_id_iq1_m_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_m_f32_disp<ggml_metal_kargs_mul_mv>>>;
+ template [[host_name("kernel_mul_mv_id_iq2_xxs_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
+diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
+index b21c53b..f751c02 100644
+--- a/ggml/src/ggml-metal/kernels/ssm.metal
++++ b/ggml/src/ggml-metal/kernels/ssm.metal
+@@ -3,6 +3,30 @@
+ constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
+ constant int  FC_ssm_conv_nc    [[function_constant(FC_SSM_CONV + 2)]];
+ 
++kernel void kernel_ssm_conv_mul_f32(
++        constant ggml_metal_kargs_ssm_conv_mul & args,
++        device const char * src0,
++        device const char * src1,
++        device float * dst,
++        device const char * gate,
++        uint gid [[thread_position_in_grid]]) {
++    constant ggml_metal_kargs_ssm_conv & a = args.conv;
++    if (gid >= a.ne0 * a.ne1 * a.ne2) {
++        return;
++    }
++    const int64_t channel = gid % a.ne0;
++    const int64_t token = (gid / a.ne0) % a.ne1;
++    const int64_t sequence = gid / (a.ne0 * a.ne1);
++    device const float * s = (device const float *) (src0 + channel*a.nb01 + token*a.nb00 + sequence*a.nb02);
++    device const float * c = (device const float *) (src1 + channel*a.nb11);
++    device const float * g = (device const float *) (gate + channel*sizeof(float) + token*args.nbg1 + sequence*args.nbg2);
++    float sum = 0.0f;
++    FOR_UNROLL (int i = 0; i < FC_ssm_conv_nc; ++i) {
++        sum += s[i] * c[i];
++    }
++    dst[gid] = sum * g[0];
++}
++
+ // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+ kernel void kernel_ssm_conv_f32_f32(
+         constant ggml_metal_kargs_ssm_conv & args,
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 49f1107..53998a0 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -27,6 +27,12 @@
+ 
+ namespace fs = std::filesystem;
+ 
++struct rpc_server_counters {
++    std::atomic<uint64_t> received {0}, sent {0}, graphs {0}, dispatch_ns {0};
++    std::atomic<uint32_t> clients {0};
++};
++static thread_local rpc_server_counters * server_counters = nullptr;
++
+ // macro for nicer error messages on server crash
+ #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+ 
+@@ -327,7 +333,8 @@ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
+     if (!sock->send_data(msg, msg_size)) {
+         return false;
+     }
+-    return sock->flush();
++    const bool ok = sock->flush();
++    return ok;
+ }
+ 
+ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
+@@ -338,7 +345,8 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
+     if (size != msg_size) {
+         return false;
+     }
+-    return sock->recv_data(msg, msg_size);
++    const bool ok = sock->recv_data(msg, msg_size);
++    return ok;
+ }
+ 
+ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+@@ -352,7 +360,8 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+         LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
+         return false;
+     }
+-    return sock->recv_data(input.data(), size);
++    const bool ok = sock->recv_data(input.data(), size);
++    return ok;
+ }
+ 
+ static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
+@@ -1385,10 +1394,59 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+ 
+ // RPC server-side implementation
+ 
++struct ggml_rpc_server_control {
++    rpc_server_counters counters;
++    std::atomic<bool> stopped {false};
++    std::atomic<bool> ready {false};
++    std::atomic<size_t> allocated {0};
++    size_t limit;
++    ggml_rpc_memory_available_t available;
++    void * user_data;
++    std::mutex mutex;
++    socket_ptr client;
++
++    size_t remaining() const {
++        const size_t used = allocated.load();
++        const size_t budget = limit > used ? limit - used : 0;
++        return available ? std::min(budget, available(user_data)) : budget;
++    }
++};
++
++ggml_rpc_server_control_t ggml_rpc_server_control_new(size_t limit, ggml_rpc_memory_available_t available, void * user_data) {
++    auto * control = new ggml_rpc_server_control;
++    control->limit = limit;
++    control->available = available;
++    control->user_data = user_data;
++    return control;
++}
++
++void ggml_rpc_server_control_stop(ggml_rpc_server_control_t control) {
++    control->stopped.store(true);
++    std::lock_guard<std::mutex> lock(control->mutex);
++    if (control->client) {
++        control->client->interrupt();
++    }
++}
++
++void ggml_rpc_server_control_free(ggml_rpc_server_control_t control) { delete control; }
++bool ggml_rpc_server_control_ready(ggml_rpc_server_control_t control) { return control->ready.load(); }
++size_t ggml_rpc_server_control_allocated(ggml_rpc_server_control_t control) { return control->allocated.load(); }
++
++void ggml_rpc_server_control_stats(ggml_rpc_server_control_t control, struct ggml_rpc_server_stats * stats) {
++    *stats = {};
++    if (!control) return;
++    stats->bytes_received = control->counters.received.load(std::memory_order_relaxed);
++    stats->bytes_sent = control->counters.sent.load(std::memory_order_relaxed);
++    stats->graph_calls = control->counters.graphs.load(std::memory_order_relaxed);
++    stats->dispatch_nanoseconds = control->counters.dispatch_ns.load(std::memory_order_relaxed);
++    stats->connected_clients = control->counters.clients.load(std::memory_order_relaxed);
++    stats->allocation_limit = control->limit;
++}
++
+ class rpc_server {
+ public:
+-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
++    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, ggml_rpc_server_control_t control = nullptr)
++        : backends(std::move(all_backends)), cache_dir(cache_dir), control(control) {
+         stored_graphs.resize(backends.size());
+         comm_states.resize(backends.size());
+     }
+@@ -1446,6 +1504,7 @@ private:
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
+     std::unordered_set<ggml_backend_buffer_t> buffers;
++    ggml_rpc_server_control_t control;
+     // computed graphs cached per backend, keyed by uid
+     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+     std::vector<comm_state> comm_states;
+@@ -1505,7 +1564,22 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
+         return false;
+     }
+     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
++    response.remote_ptr = 0;
++    response.remote_size = 0;
++    const size_t alignment = ggml_backend_buft_get_alignment(buft);
++    if (request.size > SIZE_MAX - alignment) {
++        return true;
++    }
++    const size_t rounded = ((request.size + alignment - 1) / alignment) * alignment;
++    if (control && (control->stopped.load() || rounded > control->remaining())) {
++        LOG_WARN("RPC allocation exceeds the app memory budget\n");
++        return true;
++    }
+     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
++    if (buffer && control && buffer->size > control->limit - std::min(control->limit, control->allocated.load())) {
++        ggml_backend_buffer_free(buffer);
++        buffer = nullptr;
++    }
+     response.remote_ptr = 0;
+     response.remote_size = 0;
+     if (buffer != nullptr) {
+@@ -1515,6 +1589,7 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
+                 __func__, dev_id, rpc_log_format_size(request.size).c_str(), response.remote_ptr,
+                 rpc_log_format_size(response.remote_size).c_str());
+         buffers.insert(buffer);
++        if (control) control->allocated.fetch_add(buffer->size);
+     } else {
+         LOG_WARN("[%s] device: %u, size: %s -> failed\n", __func__, dev_id, rpc_log_format_size(request.size).c_str());
+     }
+@@ -1573,6 +1648,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+             sg.second.graph = nullptr;
+         }
+     }
++    if (control) control->allocated.fetch_sub(buffer->size);
+     ggml_backend_buffer_free(buffer);
+     buffers.erase(buffer);
+     return true;
+@@ -2222,6 +2298,10 @@ void rpc_server::sync_all_backends() {
+ // The comm link between two servers uses the same caps negotiation as the client HELLO,
+ // so it gets the same transport upgrades (e.g. RDMA).
+ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
++    if (control) {
++        LOG_ERROR("Embedded workers support layer splitting, not peer allreduce\n");
++        return false;
++    }
+     response.ok = 0;
+     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
+         return true;
+@@ -2420,20 +2500,38 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
+     ggml_backend_dev_memory(dev, &free, &total);
+     response.free_mem = free;
+     response.total_mem = total;
++    if (control) {
++        response.total_mem = std::min(total, control->limit);
++        response.free_mem = std::min(free, control->remaining());
++    }
+     LOG_DBG2("[%s] device: %u, free: %s, total: %s\n", __func__, dev_id,
+              rpc_log_format_size(response.free_mem).c_str(), rpc_log_format_size(response.total_mem).c_str());
+     return true;
+ }
+ 
+ rpc_server::~rpc_server() {
++    sync_all_backends();
+     for (auto buffer : buffers) {
+         ggml_backend_buffer_free(buffer);
+     }
++    if (control) control->allocated.store(0);
+ }
+ 
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+-                             socket_ptr sock) {
+-    rpc_server server(backends, cache_dir);
++                             socket_ptr sock, ggml_rpc_server_control_t control = nullptr) {
++    if (control) sock->set_counters(&control->counters.received, &control->counters.sent);
++    struct counter_scope {
++        rpc_server_counters * counters;
++        explicit counter_scope(ggml_rpc_server_control_t control) : counters(control ? &control->counters : nullptr) {
++            server_counters = counters;
++            if (counters) counters->clients.fetch_add(1, std::memory_order_relaxed);
++        }
++        ~counter_scope() {
++            if (counters) counters->clients.fetch_sub(1, std::memory_order_relaxed);
++            server_counters = nullptr;
++        }
++    } counted(control);
++    rpc_server server(backends, cache_dir, control);
+     uint8_t cmd;
+     if (!sock->recv_data(&cmd, 1)) {
+         return;
+@@ -2688,9 +2786,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!recv_msg(sock, input)) {
+                     return;
+                 }
++                const auto started = std::chrono::steady_clock::now();
+                 if (!server.graph_compute(input)) {
+                     return;
+                 }
++                if (server_counters) {
++                    const auto elapsed = std::chrono::steady_clock::now() - started;
++                    server_counters->graphs.fetch_add(1, std::memory_order_relaxed);
++                    server_counters->dispatch_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(), std::memory_order_relaxed);
++                }
+                 break;
+             }
+             case RPC_CMD_GRAPH_RECOMPUTE: {
+@@ -2698,9 +2802,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+                     return;
+                 }
++                const auto started = std::chrono::steady_clock::now();
+                 if (!server.graph_recompute(request)) {
+                     return;
+                 }
++                if (server_counters) {
++                    const auto elapsed = std::chrono::steady_clock::now() - started;
++                    server_counters->graphs.fetch_add(1, std::memory_order_relaxed);
++                    server_counters->dispatch_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(), std::memory_order_relaxed);
++                }
+                 break;
+             }
+             case RPC_CMD_COMM_INIT: {
+@@ -2759,6 +2869,46 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+     }
+ }
+ 
++bool ggml_backend_rpc_run_server(const char * endpoint, const char * cache_dir,
++    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices, ggml_rpc_server_control_t control) {
++    if (!control || !devices || n_devices != 1) return false;
++    std::string host;
++    int port;
++    if (!parse_endpoint(endpoint, host, port) || !rpc_transport_init()) return false;
++    struct cleanup {
++        std::vector<ggml_backend_t> backends;
++        ggml_rpc_server_control_t control;
++        ~cleanup() {
++            control->ready.store(false);
++            { std::lock_guard<std::mutex> lock(control->mutex); control->client.reset(); }
++            for (auto backend : backends) ggml_backend_free(backend);
++            rpc_transport_shutdown();
++        }
++    } owned {{}, control};
++    auto backend = ggml_backend_dev_init(devices[0], nullptr);
++    if (!backend) return false;
++    owned.backends.push_back(backend);
++    auto reg = ggml_backend_dev_backend_reg(devices[0]);
++    auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
++    if (set_threads) set_threads(backend, n_threads);
++    auto listener = socket_t::create_server(host.c_str(), port);
++    if (!listener) return false;
++    control->ready.store(!control->stopped.load());
++    while (!control->stopped.load()) {
++        if (!listener->wait_readable(200)) continue;
++        auto client = listener->accept();
++        if (!client) return false;
++        {
++            std::lock_guard<std::mutex> lock(control->mutex);
++            if (control->stopped.load()) break;
++            control->client = client;
++        }
++        rpc_serve_client(owned.backends, cache_dir, client, control);
++        { std::lock_guard<std::mutex> lock(control->mutex); control->client.reset(); }
++    }
++    return true;
++}
++
+ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+     if (n_devices == 0 || devices == nullptr) {
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 22b38e0..2cd5da7 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -125,7 +125,13 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
+ #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
+ 
+ struct socket_t::impl {
+-    impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
++    impl(sockfd_t fd) : use_rdma(false), fd(fd) {
++#ifdef SO_NOSIGPIPE
++        // An app must survive disconnects while a worker is sending data.
++        const int enabled = 1;
++        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
++#endif
++    }
+     ~impl();
+     bool send_data(const void * data, size_t size);
+     bool recv_data(void * data, size_t size);
+@@ -153,6 +159,8 @@ struct socket_t::impl {
+ #endif // GGML_RPC_RDMA
+     bool     use_rdma;
+     sockfd_t fd;
++    std::atomic<uint64_t> * received = nullptr;
++    std::atomic<uint64_t> * sent = nullptr;
+ };
+ 
+ socket_t::impl::~impl() {
+@@ -535,11 +543,15 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
+ #ifdef GGML_RPC_RDMA_APPLE
+     if (use_rdma) {
+-        return rdma->send(data, size);
++        const bool ok = rdma->send(data, size);
++        if (ok && sent) sent->fetch_add(size, std::memory_order_relaxed);
++        return ok;
+     }
+ #elif defined(GGML_RPC_RDMA)
+     if (use_rdma) {
+-        return rdma_send(data, size);
++        const bool ok = rdma_send(data, size);
++        if (ok && sent) sent->fetch_add(size, std::memory_order_relaxed);
++        return ok;
+     }
+ #endif
+     size_t bytes_sent = 0;
+@@ -552,6 +564,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+             return false;
+         }
+         bytes_sent += (size_t)n;
++        if (sent) sent->fetch_add((uint64_t) n, std::memory_order_relaxed);
+     }
+     return true;
+ }
+@@ -560,11 +573,15 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
+     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
+ #ifdef GGML_RPC_RDMA_APPLE
+     if (use_rdma) {
+-        return rdma->recv(data, size);
++        const bool ok = rdma->recv(data, size);
++        if (ok && received) received->fetch_add(size, std::memory_order_relaxed);
++        return ok;
+     }
+ #elif defined(GGML_RPC_RDMA)
+     if (use_rdma) {
+-        return rdma_recv(data, size);
++        const bool ok = rdma_recv(data, size);
++        if (ok && received) received->fetch_add(size, std::memory_order_relaxed);
++        return ok;
+     }
+ #endif
+     size_t bytes_recv = 0;
+@@ -581,6 +598,7 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
+             return false;
+         }
+         bytes_recv += (size_t)n;
++        if (received) received->fetch_add((uint64_t) n, std::memory_order_relaxed);
+     }
+     return true;
+ }
+@@ -671,6 +689,11 @@ bool socket_t::recv_data(void * data, size_t size) {
+     return pimpl->recv_data(data, size);
+ }
+ 
++void socket_t::set_counters(std::atomic<uint64_t> * received, std::atomic<uint64_t> * sent) {
++    pimpl->received = received;
++    pimpl->sent = sent;
++}
++
+ bool socket_t::flush() {
+     return pimpl->flush();
+ }
+@@ -708,6 +731,22 @@ static bool set_reuse_addr(sockfd_t sockfd) {
+     return ret == 0;
+ }
+ 
++bool socket_t::wait_readable(int milliseconds) {
++    fd_set read_fds;
++    FD_ZERO(&read_fds);
++    FD_SET(pimpl->fd, &read_fds);
++    timeval timeout { milliseconds / 1000, (milliseconds % 1000) * 1000 };
++    return select(static_cast<int>(pimpl->fd) + 1, &read_fds, nullptr, nullptr, &timeout) > 0;
++}
++
++void socket_t::interrupt() {
++#ifdef _WIN32
++    shutdown(pimpl->fd, SD_BOTH);
++#else
++    shutdown(pimpl->fd, SHUT_RDWR);
++#endif
++}
++
+ socket_ptr socket_t::accept() {
+     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
+     if (!is_valid_fd(client_socket_fd)) {
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 59b8845..0c3c369 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ 
+@@ -15,12 +16,15 @@ struct socket_t {
+ 
+     bool send_data(const void * data, size_t size);
+     bool recv_data(void * data, size_t size);
++    void set_counters(std::atomic<uint64_t> * received, std::atomic<uint64_t> * sent);
+     // Must be called at every message boundary: the RDMA transport coalesces
+     // writes into fixed-size frames and posts the trailing partial frame only
+     // here. No-op on TCP.
+     bool flush();
+ 
+     socket_ptr accept();
++    bool wait_readable(int milliseconds);
++    void interrupt();
+ 
+     void get_caps(uint8_t * local_caps);
+     void update_caps(const uint8_t * remote_caps);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..ec78bbf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1921,8 +1921,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    static const bool stable_verify = []() {
++        const char * value = getenv("LLAMAPAD_METAL_STABLE_REPLAY");
++        return value && strcmp(value, "1") == 0;
++    }();
++    const uint32_t verification_ubatch = stable_verify && model.arch == LLM_ARCH_LFM2MOE &&
++        cparams.n_seq_max == 1 && cparams.causal_attn && !output_all && n_outputs_all == n_tokens_all ?
++        std::min<uint32_t>(9, cparams.n_ubatch) : cparams.n_ubatch;
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
++        mctx = memory->init_batch(*balloc, verification_ubatch, embd_all);
+         if (!mctx) {
+             return -2;
+         }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a18b754..cfb3cb4 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -265,6 +265,7 @@ struct server_slot {
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
++    bool spec_replay_has_correction = true;
+     std::mt19937 spec_synth_rng;
+ 
+     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
+@@ -379,6 +380,7 @@ struct server_slot {
+         SLT_DBG(*this, "%s", "\n");
+ 
+         spec_is_replay = false;
++        spec_replay_has_correction = true;
+ 
+         last_nl_pos    = 0;
+         generated      = {};
+@@ -3521,6 +3523,24 @@ private:
+             auto & draft = slot.spec_draft;
+             auto & ckpt  = slot.spec_ckpt;
+ 
++            static const bool stable_verify = []() {
++                const char * value = getenv("LLAMAPAD_METAL_STABLE_REPLAY");
++                return value && strcmp(value, "1") == 0;
++            }();
++            if (stable_verify && draft.size() > 8 && !ctx_dft &&
++                    slot.task->params.sampling.temp == 0.0f &&
++                    slot.task->params.sampling.dynatemp_range == 0.0f &&
++                    slot.task->params.sampling.mirostat == 0 && slot.task->params.sampling.n_probs == 0 &&
++                    std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
++                        COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != params_base.speculative.types.end() &&
++                    std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
++                        [](common_speculative_type type) {
++                            return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
++                        })) {
++                // A complete verification unit includes eight proposals and one target bonus.
++                draft.resize(((draft.size() + 1) / 9) * 9 - 1);
++            }
++
+             slot.stats.n_draft_tokens += draft.size();
+ 
+             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+@@ -4562,6 +4582,26 @@ private:
+                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                         slot.spec_is_replay = true;
+                         slot.spec_draft = std::move(accepted);
++                        static const bool stable_replay = []() {
++                            const char * value = getenv("LLAMAPAD_METAL_STABLE_REPLAY");
++                            return value && strcmp(value, "1") == 0;
++                        }();
++                        const bool pending_correction = stable_replay && slot.spec_draft.size() > 8 &&
++                            slot.spec_draft.size() % 9 == 0 &&
++                            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
++                                COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != params_base.speculative.types.end() &&
++                            std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
++                                [](common_speculative_type type) {
++                                    return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
++                                }) && synth_probs.empty() && slot.task->params.sampling.temp == 0.0f &&
++                            slot.task->params.sampling.dynatemp_range == 0.0f &&
++                            slot.task->params.sampling.mirostat == 0 && slot.task->params.sampling.n_probs == 0;
++                        slot.spec_replay_has_correction = !pending_correction;
++                        if (pending_correction) {
++                            // Keep the correction out of the dense replay to reduce batch-dependent rounding.
++                            slot.spec_draft.pop_back();
++                            SLT_DBG(slot, "stable replay: correction pending, replay draft = %zu\n", slot.spec_draft.size());
++                        }
+ 
+                         const auto & ckpt = slot.spec_ckpt;
+ 
+@@ -4594,10 +4634,11 @@ private:
+             const auto ids = std::move(slot.spec_draft);
+ 
+             size_t n_accepted = ids.size() - 1;
+-            if (slot.spec_is_replay && n_accepted > 0) {
++            if (slot.spec_is_replay && slot.spec_replay_has_correction && n_accepted > 0) {
+                 n_accepted--;
+             }
+             slot.spec_is_replay = false;
++            slot.spec_replay_has_correction = true;
+ 
+             slot.stats.update_gen_last();
+ 

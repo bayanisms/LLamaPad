@@ -1,0 +1,17 @@
+/* Shared with LlamaPad's native terracotta accent and grouped surfaces. */
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  --primary: #c24526; --primary-foreground: #fff;
+  --ring: #c24526; --sidebar-primary: #c24526;
+  --sidebar-primary-foreground: #fff;
+  --background: #f2f2f7; --sidebar: #f2f2f7;
+  --card: #fff; --radius: 1rem;
+}
+.dark {
+  --primary: #ff875c; --primary-foreground: #000;
+  --ring: #ff875c; --sidebar-primary: #ff875c;
+  --sidebar-primary-foreground: #000;
+  --background: #1c1c1e; --sidebar: #1c1c1e;
+  --card: #2c2c2e;
+}
+body { font-family: var(--font-sans); -webkit-tap-highlight-color: transparent; }

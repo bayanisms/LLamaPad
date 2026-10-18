@@ -1,0 +1,4 @@
+module LlamaNative {
+    header "LlamaNative.h"
+    export *
+}
